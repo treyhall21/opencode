@@ -17,6 +17,7 @@ import { SessionLock } from "./lock"
 import { ProviderTransform } from "@/provider/transform"
 import { SessionRetry } from "./retry"
 import { Config } from "@/config/config"
+import { SessionProcessor } from "./processor"
 
 export namespace SessionCompaction {
   const log = Log.create({ service: "session.compaction" })
@@ -134,23 +135,25 @@ export namespace SessionCompaction {
       },
     })) as MessageV2.Assistant
 
-    const part = (await Session.updatePart({
-      type: "text",
+    const processor = new SessionProcessor({
       sessionID: input.sessionID,
-      messageID: msg.id,
-      id: Identifier.ascending("part"),
-      text: "",
-      time: {
-        start: Date.now(),
-      },
-    })) as MessageV2.TextPart
+      model: model.info,
+      providerID: model.providerID,
+      abort: signal,
+    })
+
+    await processor.start(msg)
 
     const doStream = () =>
       streamText({
         // set to 0, we handle loop
         maxRetries: 0,
         model: model.language,
-        providerOptions: ProviderTransform.providerOptions(model.npm, model.providerID, model.info.options),
+        providerOptions: ProviderTransform.providerOptions(
+          model.npm,
+          model.providerID,
+          model.info.options,
+        ),
         headers: model.info.headers,
         abortSignal: signal,
         onError(error) {
@@ -179,91 +182,10 @@ export namespace SessionCompaction {
         ],
       })
 
-    // TODO: reduce duplication between compaction.ts & prompt.ts
-    const process = async (
-      stream: StreamTextResult<Record<string, AITool>, never>,
-      retries: { count: number; max: number },
-    ) => {
-      let shouldRetry = false
-      try {
-        for await (const value of stream.fullStream) {
-          signal.throwIfAborted()
-          switch (value.type) {
-            case "text-delta":
-              part.text += value.text
-              if (value.providerMetadata) part.metadata = value.providerMetadata
-              if (part.text)
-                await Session.updatePart({
-                  part,
-                  delta: value.text,
-                })
-              continue
-            case "text-end": {
-              part.text = part.text.trimEnd()
-              part.time = {
-                start: Date.now(),
-                end: Date.now(),
-              }
-              if (value.providerMetadata) part.metadata = value.providerMetadata
-              await Session.updatePart(part)
-              continue
-            }
-            case "finish-step": {
-              const usage = Session.getUsage({
-                model: model.info,
-                usage: value.usage,
-                metadata: value.providerMetadata,
-              })
-              msg.cost += usage.cost
-              msg.tokens = usage.tokens
-              await Session.updateMessage(msg)
-              continue
-            }
-            case "error":
-              throw value.error
-            default:
-              continue
-          }
-        }
-      } catch (e) {
-        log.error("compaction error", {
-          error: e,
-        })
-        const error = MessageV2.fromError(e, { providerID: input.providerID })
-        if (retries.count < retries.max && MessageV2.APIError.isInstance(error) && error.data.isRetryable) {
-          shouldRetry = true
-          await Session.updatePart({
-            id: Identifier.ascending("part"),
-            messageID: msg.id,
-            sessionID: msg.sessionID,
-            type: "retry",
-            attempt: retries.count + 1,
-            time: {
-              created: Date.now(),
-            },
-            error,
-          })
-        } else {
-          msg.error = error
-          Bus.publish(Session.Event.Error, {
-            sessionID: msg.sessionID,
-            error: msg.error,
-          })
-        }
-      }
-
-      const parts = await Session.getParts(msg.id)
-      return {
-        info: msg,
-        parts,
-        shouldRetry,
-      }
-    }
-
     let stream = doStream()
     const cfg = await Config.get()
     const maxRetries = cfg.experimental?.chatMaxRetries ?? MAX_RETRIES
-    let result = await process(stream, {
+    let result = await processor.process(stream, {
       count: 0,
       max: maxRetries,
     })
@@ -303,7 +225,7 @@ export namespace SessionCompaction {
         }
 
         stream = doStream()
-        result = await process(stream, {
+        result = await processor.process(stream, {
           count: retry,
           max: maxRetries,
         })
@@ -312,6 +234,7 @@ export namespace SessionCompaction {
         }
       }
     }
+    await processor.end()
 
     msg.time.completed = Date.now()
 
