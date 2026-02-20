@@ -164,6 +164,7 @@ export function createVoiceMemoStore() {
   }
 
   async function startRecording(name?: string): Promise<void> {
+    if (recording()) return
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
     const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus") ? "audio/webm;codecs=opus" : "audio/webm"
     recorder = new MediaRecorder(stream, { mimeType })
@@ -187,13 +188,18 @@ export function createVoiceMemoStore() {
         audio: blob,
       }
 
-      const audio = new Audio(URL.createObjectURL(blob))
+      const url = URL.createObjectURL(blob)
+      const audio = new Audio(url)
       await new Promise<void>((resolve) => {
         audio.onloadedmetadata = () => {
           memo.duration = audio.duration
+          URL.revokeObjectURL(url)
           resolve()
         }
-        audio.onerror = () => resolve()
+        audio.onerror = () => {
+          URL.revokeObjectURL(url)
+          resolve()
+        }
       })
 
       await save(memo)
@@ -211,14 +217,14 @@ export function createVoiceMemoStore() {
     }
   }
 
-  async function trim(id: string, range: TrimRange): Promise<void> {
+  async function trim(id: string, range: TrimRange): Promise<boolean> {
     const memo = await load(id)
-    if (!memo) return
+    if (!memo) return false
     const decoded = await decodeAudio(memo.audio)
     const rate = decoded.sampleRate
     const startSample = Math.max(0, Math.floor(range.start * rate))
     const endSample = Math.min(decoded.length, Math.floor(range.end * rate))
-    if (startSample >= endSample) return
+    if (startSample >= endSample) return false
 
     const length = endSample - startSample
     const offline = new OfflineAudioContext(decoded.numberOfChannels, length, rate)
@@ -245,6 +251,7 @@ export function createVoiceMemoStore() {
 
     await save(updated)
     await refresh()
+    return true
   }
 
   async function restoreOriginal(id: string): Promise<boolean> {
